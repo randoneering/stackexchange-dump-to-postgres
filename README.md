@@ -1,7 +1,7 @@
 # StackOverflow data to postgres
 
 This is a quick script to move the Stackoverflow data from the [StackExchange
-data dump (Sept '14)](https://archive.org/details/stackexchange) to a Postgres
+data dump (Sept '25)](https://archive.org/details/stackexchange_20250930) to a Postgres
 SQL database.
 
 Schema hints are taken from [a post on
@@ -10,20 +10,29 @@ and from [StackExchange Data Explorer](http://data.stackexchange.com).
 
 ## Quickstart
 
-Install requirements, create a new database (e.g. `beerSO` below), and use `load_into_pg.py` script:
+### Using uv (Recommended)
+
+Install dependencies with [uv](https://github.com/astral-sh/uv), create a new database (e.g. `beerSO` below) or let the script create it for you, and run the script:
+
+``` console
+$ uv sync
+$ createdb beerSO
+$ uv run python load_into_pg.py -s beer -d beerSO
+```
+
+### Using pip
+
+Alternatively, you can use pip:
 
 ``` console
 $ pip install -r requirements.txt
-...
-Successfully installed argparse-1.2.1 libarchive-c-2.9 lxml-4.5.2 psycopg2-binary-2.8.4 six-1.10.0
 $ createdb beerSO
 $ python load_into_pg.py -s beer -d beerSO
 ```
 
 This will download compressed files from
-[archive.org](https://ia800107.us.archive.org/27/items/stackexchange/) and load
+[archive.org](https://archive.org/download/stackexchange_20250930/stackexchange_20250930/) and load
 all the tables at once.
-
 
 ## Advanced Usage
 
@@ -46,7 +55,7 @@ You can download manually the files to the folder from where the program is
 executed: `Badges.xml`, `Votes.xml`, `Posts.xml`, `Users.xml`, `Tags.xml`. In
 some old dumps, the cases in the filenames are different.
 
-Then load each file with e.g. `python load_into_pg.py -t Badges`.
+Then load each file with e.g. `uv run python load_into_pg.py -t Badges`.
 
 After all the initial tables have been created:
 
