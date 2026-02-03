@@ -317,7 +317,7 @@ parser.add_argument(
 parser.add_argument(
     "--archive-url",
     help="URL of the archive directory to retrieve.",
-    default="https://ia800107.us.archive.org/27/items/stackexchange",
+    default="https://archive.org/download/stackexchange_20250930/stackexchange_20250930",
 )
 
 parser.add_argument(

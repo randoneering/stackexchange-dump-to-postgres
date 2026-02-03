@@ -3,5 +3,6 @@
 *.xml
 *.pyc
 .env/
+.venv/
 private/
 ./idea
