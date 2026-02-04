@@ -25,7 +25,11 @@ def parse(fp):
         elem.clear()
         # second, delete previous siblings (records)
         while elem.getprevious() is not None:
-            del elem.getparent()[0]
+            parent = elem.getparent()
+            if parent is not None:
+                del parent[0]
+            else:
+                break
         # make sure you have no references to Element objects outside the loop
 
 

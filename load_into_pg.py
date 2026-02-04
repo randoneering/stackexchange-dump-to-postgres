@@ -1,13 +1,16 @@
 #!/usr/bin/env python
 
+import argparse
+import json
+import os
 import sys
 import time
-import argparse
+
 import psycopg2 as pg
-import os
-import row_processor as Processor
+from psycopg2 import sql
 import six
-import json
+
+import row_processor as Processor
 
 # Special rules needed for certain tables (esp. for old database dumps)
 specialRules = {("Posts", "ViewCount"): "NULLIF(%(ViewCount)s, '')::int"}
@@ -70,6 +73,62 @@ def getConnectionParameters():
         parameters['options'] = "-c search_path=" + args.schema_name
 
     return parameters
+
+
+def ensureDatabaseExists():
+    """Create the database if it does not exist.
+
+    Connects to the default 'postgres' database to check if the target
+    database exists, and creates it if needed. This avoids connection
+    errors when the database hasn't been created yet.
+    """
+    # Get connection parameters but override dbname to connect to postgres
+    params = getConnectionParameters()
+    target_dbname = params.get('dbname', 'stackoverflow')
+    params['dbname'] = 'postgres'
+
+    conn = None
+    try:
+        # Connect to postgres database to check if target exists
+        conn = pg.connect(**params)
+        # Set autocommit for CREATE DATABASE (cannot run in transaction)
+        conn.autocommit = True
+
+        with conn.cursor() as cur:
+            # Check if database exists
+            cur.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s",
+                (target_dbname,)
+            )
+            exists = cur.fetchone()
+
+            if not exists:
+                six.print_(
+                    "Database '{}' does not exist. Creating...".format(target_dbname)
+                )
+                # Create database with proper quoting to avoid SQL injection
+                # Use SQL identifier composition for safe database name
+                cur.execute(
+                    sql.SQL("CREATE DATABASE {}").format(
+                        sql.Identifier(target_dbname)
+                    )
+                )
+                six.print_(
+                    "Database '{}' created successfully.".format(target_dbname)
+                )
+            else:
+                six.print_(
+                    "Database '{}' already exists.".format(target_dbname)
+                )
+    except pg.Error as e:
+        six.print_(
+            "Error checking/creating database: {}".format(str(e)),
+            file=sys.stderr
+        )
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _makeDefValues(keys):
@@ -317,7 +376,7 @@ parser.add_argument(
 parser.add_argument(
     "--archive-url",
     help="URL of the archive directory to retrieve.",
-    default="https://ia800107.us.archive.org/27/items/stackexchange",
+    default="https://archive.org/download/stackexchange_20250930/stackexchange_20250930",
 )
 
 parser.add_argument(
@@ -368,6 +427,9 @@ try:
     input = raw_input
 except NameError:
     pass
+
+# Ensure database exists before proceeding
+ensureDatabaseExists()
 
 # load given file in table
 if args.file and args.table:

@@ -1,0 +1,21 @@
+[project]
+name = "stackexchange-dump-to-postgres"
+version = "0.1.0"
+description = "Load StackExchange data dumps into PostgreSQL"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "libarchive-c>=2.9",
+    "lxml>=4.9.0",
+    "psycopg2-binary>=2.9.0",
+    "six>=1.16.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["load_into_pg.py", "row_processor.py", "sql/*.sql"]
