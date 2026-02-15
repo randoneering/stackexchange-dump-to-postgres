@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 
 import argparse
+import getpass
 import json
 import os
 import sys
 import time
+from typing import Any
 
 import psycopg2 as pg
 from psycopg2 import sql
@@ -17,6 +19,8 @@ specialRules = {("Posts", "ViewCount"): "NULLIF(%(ViewCount)s, '')::int"}
 
 # part of the file already downloaded
 file_part = None
+_resolved_password = None
+_password_loaded = False
 
 
 def show_progress(block_num, block_size, total_size):
@@ -49,81 +53,130 @@ def show_progress(block_num, block_size, total_size):
         file_part = None
         six.print_("")
 
+
 def getConnectionParameters():
     """Get the parameters for the connection to the database."""
 
     parameters = {}
 
     if args.dbname:
-        parameters['dbname'] = args.dbname
+        parameters["dbname"] = args.dbname
 
     if args.host:
-        parameters['host'] = args.host
+        parameters["host"] = args.host
 
     if args.port:
-        parameters['port'] = args.port
+        parameters["port"] = args.port
 
     if args.username:
-        parameters['user'] = args.username
+        parameters["user"] = args.username
 
-    if args.password:
-        parameters['password'] = args.password
+    password = _resolvePassword()
+    if password:
+        parameters["password"] = password
 
-    if args.schema_name:
-        parameters['options'] = "-c search_path=" + args.schema_name
+    sslmode = args.sslmode
+    if not sslmode and args.host and args.host.endswith(".neon.tech"):
+        # Neon pooler requires TLS. Enable it automatically for Neon hosts.
+        sslmode = "require"
+
+    if sslmode:
+        parameters["sslmode"] = sslmode
 
     return parameters
+
+
+def _resolvePassword():
+    """Resolve password from CLI/env/file/prompt exactly once.
+
+    If no password source is configured, libpq defaults are used, which include
+    ~/.pgpass and environment variables supported by libpq.
+    """
+    global _resolved_password, _password_loaded
+
+    if _password_loaded:
+        return _resolved_password
+
+    _password_loaded = True
+
+    if args.password:
+        _resolved_password = args.password
+        return _resolved_password
+
+    if args.password_env:
+        _resolved_password = os.getenv(args.password_env)
+        if _resolved_password is None:
+            raise RuntimeError(
+                "Password environment variable '{}' is not set.".format(
+                    args.password_env
+                )
+            )
+        return _resolved_password
+
+    if args.password_file:
+        try:
+            with open(args.password_file) as f:
+                _resolved_password = f.readline().rstrip("\r\n")
+        except OSError as e:
+            raise RuntimeError(
+                "Could not read password file '{}': {}".format(
+                    args.password_file, str(e)
+                )
+            )
+        return _resolved_password
+
+    if args.prompt_password:
+        _resolved_password = getpass.getpass("PostgreSQL password: ")
+        return _resolved_password
+
+    return None
 
 
 def ensureDatabaseExists():
     """Create the database if it does not exist.
 
-    Connects to the default 'postgres' database to check if the target
-    database exists, and creates it if needed. This avoids connection
-    errors when the database hasn't been created yet.
+    First tries to connect to the target database directly. If it exists, we
+    continue. If it does not exist, connect to the 'postgres' database and
+    create it.
     """
-    # Get connection parameters but override dbname to connect to postgres
     params = getConnectionParameters()
-    target_dbname = params.get('dbname', 'stackoverflow')
-    params['dbname'] = 'postgres'
+    target_dbname = params.get("dbname", "stackoverflow")
+
+    # Fast path: database already exists and is accessible.
+    try:
+        with pg.connect(**params):
+            six.print_("Database '{}' already exists.".format(target_dbname))
+            return
+    except pg.Error as e:
+        # 3D000 = invalid_catalog_name (database does not exist)
+        if e.pgcode != "3D000":
+            six.print_(
+                "Error checking/creating database: {}".format(str(e)), file=sys.stderr
+            )
+            raise
+
+    admin_params = dict(params)
+    admin_params["dbname"] = "postgres"
 
     conn = None
     try:
-        # Connect to postgres database to check if target exists
-        conn = pg.connect(**params)
+        # Connect to postgres database to create target database
+        conn = pg.connect(**admin_params)
         # Set autocommit for CREATE DATABASE (cannot run in transaction)
         conn.autocommit = True
 
         with conn.cursor() as cur:
-            # Check if database exists
-            cur.execute(
-                "SELECT 1 FROM pg_database WHERE datname = %s",
-                (target_dbname,)
+            six.print_(
+                "Database '{}' does not exist. Creating...".format(target_dbname)
             )
-            exists = cur.fetchone()
-
-            if not exists:
-                six.print_(
-                    "Database '{}' does not exist. Creating...".format(target_dbname)
-                )
-                # Create database with proper quoting to avoid SQL injection
-                # Use SQL identifier composition for safe database name
-                cur.execute(
-                    sql.SQL("CREATE DATABASE {}").format(
-                        sql.Identifier(target_dbname)
-                    )
-                )
-                six.print_(
-                    "Database '{}' created successfully.".format(target_dbname)
-                )
-            else:
-                six.print_(
-                    "Database '{}' already exists.".format(target_dbname)
-                )
+            # Create database with proper quoting to avoid SQL injection
+            cur.execute(
+                sql.SQL("CREATE DATABASE {}").format(sql.Identifier(target_dbname))
+            )
+            six.print_("Database '{}' created successfully.".format(target_dbname))
     except pg.Error as e:
         six.print_(
-            "Error checking/creating database: {}".format(str(e)),
-            file=sys.stderr
+            "Error checking/creating database: {}".format(str(e)), file=sys.stderr
         )
         raise
     finally:
@@ -133,7 +186,29 @@ def ensureDatabaseExists():
 
 def _makeDefValues(keys):
     """Returns a dictionary containing None for all keys."""
-    return dict(((k, None) for k in keys))
+    return {k: None for k in keys}
+
+
+def _setSearchPath(cur):
+    """Apply schema search_path after connect.
+
+    Some managed poolers (e.g. Neon pooler) reject startup options, so we set
+    search_path with SQL after the connection has been established.
+    """
+    if not args.schema_name:
+        return
+
+    schemas = [
+        schema.strip() for schema in args.schema_name.split(",") if schema.strip()
+    ]
+    if not schemas:
+        return
+
+    cur.execute(
+        sql.SQL("SET search_path TO {}").format(
+            sql.SQL(", ").join([sql.Identifier(schema) for schema in schemas])
+        )
+    )
 
 
 def _createMogrificationTemplate(table, keys, insertJson):
@@ -159,7 +234,7 @@ def _createCmdTuple(cursor, keys, templ, attribs, insertJson):
     `cursor` is used to mogrify the data and the `templ` is the template used
     for the mogrification.
     """
-    defs = _makeDefValues(keys)
+    defs: dict[str, Any] = _makeDefValues(keys)
     defs.update(attribs)
 
     if insertJson:
@@ -261,6 +336,8 @@ def handleTable(table, insertJson, createFk, mbDbFile):
         with pg.connect(**getConnectionParameters()) as conn:
             with conn.cursor() as cur:
                 try:
+                    _setSearchPath(cur)
+
                     with open(dbFile, "rb") as xml:
                         # Pre-processing (dropping/creation of tables)
                         six.print_("Pre-processing ...")
@@ -338,6 +415,7 @@ def handleTable(table, insertJson, createFk, mbDbFile):
         six.print_("Warning from the database.", file=sys.stderr)
         six.print_("pg.Warning: {0}".format(str(w)), file=sys.stderr)
 
+
 #############################################################
 
 parser = argparse.ArgumentParser()
@@ -389,7 +467,29 @@ parser.add_argument(
 
 parser.add_argument("-u", "--username", help="Username for the database.", default=None)
 
-parser.add_argument("-p", "--password", help="Password for the database.", default=None)
+password_group = parser.add_mutually_exclusive_group()
+password_group.add_argument(
+    "-p",
+    "--password",
+    help="Password for the database (less secure; visible in shell history).",
+    default=None,
+)
+password_group.add_argument(
+    "--password-env",
+    help="Environment variable name containing the database password.",
+    default=None,
+)
+password_group.add_argument(
+    "--password-file",
+    help="Read the database password from the first line of a file.",
+    default=None,
+)
+password_group.add_argument(
+    "--prompt-password",
+    help="Prompt for database password without echo.",
+    action="store_true",
+    default=False,
+)
 
 parser.add_argument(
     "-P", "--port", help="Port to connect with the database on.", default=None
@@ -417,6 +517,13 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--sslmode",
+    help="SSL mode for PostgreSQL connection.",
+    choices=["disable", "allow", "prefer", "require", "verify-ca", "verify-full"],
+    default=None,
+)
+
+parser.add_argument(
     "--foreign-keys", help="Create foreign keys.", action="store_true", default=False
 )
 
@@ -424,7 +531,7 @@ args = parser.parse_args()
 
 try:
     # Python 2/3 compatibility
-    input = raw_input
+    input = raw_input  # type: ignore[name-defined]
 except NameError:
     pass
 
@@ -443,8 +550,7 @@ if args.file and args.table:
     choice = input("This will drop the {} table. Are you sure [y/n]?".format(table))
 
     if len(choice) > 0 and choice[0].lower() == "y":
-        handleTable(
-            table, args.insert_json, args.foreign_keys, args.file)
+        handleTable(table, args.insert_json, args.foreign_keys, args.file)
     else:
         six.print_("Cancelled.")
 
